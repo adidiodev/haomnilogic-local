@@ -12,6 +12,6 @@
   "loggers": ["pyomnilogic_local"],
   "requirements": ["python-omnilogic-local==5.0.2"],
   "ssdp": [],
-  "version": "0.0.0",
+  "version": "2.0.2.1",
   "zeroconf": []
 }

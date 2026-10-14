@@ -12,7 +12,7 @@ This fork tracks [cryptk/haomnilogic-local](https://github.com/cryptk/haomnilogi
 
 ## Releases
 
-Tags are `<upstream version>.<fork revision>` (e.g. `2.0.2.1`). Each GitHub release carries an `omnilogic_local.zip` asset because `hacs.json` uses `zip_release`. HACS installs from these releases.
+HACS installs this fork straight from the `main` branch (no GitHub releases; `zip_release` is removed from `hacs.json`), so every push to `main` shows up in HACS as an update. The integration version in `manifest.json` is `<upstream version>.<fork revision>` (e.g. `2.0.2.1`); bump it with each change so HA reports what is installed.
 
 ## Updating to a new upstream release
 
@@ -21,5 +21,5 @@ git fetch upstream --tags
 git rebase <new upstream tag>        # replay the fork commits
 # drop any fork commit upstream has merged (e.g. PR #272)
 git push --force-with-lease origin main
-# then publish a release tagged <new upstream tag>.1 with the zip asset
+# bump manifest.json version to <new upstream tag>.1 before pushing
 ```
