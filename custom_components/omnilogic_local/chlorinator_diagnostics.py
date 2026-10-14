@@ -10,11 +10,12 @@ request itself through the library's transport and exposes the results as sensor
 Protocol notes (decoded from the Hayward OmniLogic app 5.2.16, confirmed against an OmniPL on
 firmware R0502000, 2026-10-14):
 
-* The controller dispatches on the XML ``<Name>``, not the UDP header message type. The native
-  request ID is 163 (response SourceOpId 1163), but python-omnilogic-local only accepts message
-  types it knows. The response to this request always arrives as a LeadMessage + BlockMessages
-  (types the library handles), so we send under the library's known read type
-  GET_FILTER_DIAGNOSTIC (386), which was verified to return ``GetCHLORMeasurementRsp``.
+* The controller dispatches on the XML ``<Name>``, not the UDP header message type. We send under
+  header type 386 (GetUIFilterDiagnosticInfo, a read), which was verified to return
+  ``GetCHLORMeasurementRsp``. The native request ID is 163.
+* The response arrives as a LeadMessage whose ``SourceOpId`` is 1163. python-omnilogic-local 5.0.2
+  validates SourceOpId against its MessageType enum and rejects it, so this module carries its own
+  minimal UDP request/ACK/reassembly instead of using the library transport.
 * Params: ``PoolID`` = body-of-water system id, ``ChlorID`` = Chlorinator-Equipment system id
   (the Chlorinator system id is ACKed but never answered).
 * Values come back as High/Low byte pairs: raw = high * 256 + low.
@@ -25,12 +26,18 @@ firmware R0502000, 2026-10-14):
 
 Changelog
     1.0.0 - 2026-10-14 - Initial version: cell temp, cell voltage, cell current, board temp.
+    1.0.1 - 2026-10-14 - Own UDP transport: the library rejected the LeadMessage (SourceOpId 1163).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+import struct
+import time
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable
@@ -40,7 +47,6 @@ from homeassistant.const import EntityCategory, UnitOfElectricCurrent, UnitOfEle
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator, UpdateFailed
 from pyomnilogic_local.api.constants import XML_NAMESPACE
-from pyomnilogic_local.omnitypes import MessageType
 
 from .const import DOMAIN, MANUFACTURER
 
@@ -54,8 +60,21 @@ _LOGGER = logging.getLogger(__name__)
 
 DIAG_SCAN_INTERVAL = timedelta(seconds=60)
 
-# Sent under a message type the library recognises; see module docstring.
-REQUEST_MESSAGE_TYPE = MessageType.GET_FILTER_DIAGNOSTIC
+# Header message type the request is sent under (see module docstring).
+REQUEST_MESSAGE_TYPE = 386
+
+_HEADER_FORMAT = "!LQ4sLBBBB"
+_HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)
+_PROTOCOL_VERSION = b"1.19"
+_MSG_ACK = 0
+_MSG_MSP_ACK = 1002
+_MSG_LEAD = 1998
+_MSG_BLOCK = 1999
+_BLOCK_HEADER_OFFSET = 8
+_ACK_TIMEOUT = 4.0
+_RESPONSE_TIMEOUT = 10.0
+_SEND_ATTEMPTS = 3
+_ACK_BODY = f'<Request xmlns="{XML_NAMESPACE}">\n<Name>Ack</Name>\n</Request>'
 REQUEST_NAME = "GetCHLORMeasurement"
 RESPONSE_NAME = "GetCHLORMeasurementRsp"
 
@@ -133,6 +152,77 @@ def parse_response(xml: str) -> dict[str, int]:
     return values
 
 
+
+def _frame(msg_id: int, msg_type: int, body: str) -> bytes:
+    header = struct.pack(_HEADER_FORMAT, msg_id, int(time.time()), _PROTOCOL_VERSION, msg_type, 0, 0, 0, 0)
+    return header + (body + "\x00").encode("utf-8")
+
+
+class _DiagProtocol(asyncio.DatagramProtocol):
+    """Minimal OmniLogic UDP client: ACKs every non-ACK message and queues it."""
+
+    def __init__(self) -> None:
+        self.transport: asyncio.DatagramTransport | None = None
+        self.acked: set[int] = set()
+        self.ack_event = asyncio.Event()
+        self.queue: asyncio.Queue[tuple[int, int, bool, bytes]] = asyncio.Queue()
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) < _HEADER_SIZE:
+            return
+        msg_id, _ts, _ver, msg_type, _client, _r1, compressed, _r2 = struct.unpack(_HEADER_FORMAT, data[:_HEADER_SIZE])
+        if msg_type in (_MSG_ACK, _MSG_MSP_ACK):
+            self.acked.add(msg_id)
+            self.ack_event.set()
+            return
+        if self.transport is not None:
+            self.transport.sendto(_frame(msg_id, _MSG_ACK, _ACK_BODY))
+        self.queue.put_nowait((msg_id, msg_type, bool(compressed), data[_HEADER_SIZE:]))
+
+
+async def _async_request(host: str, port: int, body: str) -> str:
+    """Send one XML request and return the reassembled XML response."""
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.create_datagram_endpoint(_DiagProtocol, remote_addr=(host, port))
+    try:
+        for attempt in range(_SEND_ATTEMPTS):
+            msg_id = random.randint(1, 2**31 - 1)
+            protocol.ack_event.clear()
+            transport.sendto(_frame(msg_id, REQUEST_MESSAGE_TYPE, body))
+            try:
+                async with asyncio.timeout(_ACK_TIMEOUT):
+                    while msg_id not in protocol.acked:
+                        await protocol.ack_event.wait()
+                        protocol.ack_event.clear()
+                break
+            except TimeoutError:
+                if attempt == _SEND_ATTEMPTS - 1:
+                    raise
+        async with asyncio.timeout(_RESPONSE_TIMEOUT):
+            _, msg_type, compressed, payload = await protocol.queue.get()
+            if msg_type == _MSG_LEAD:
+                lead = ET.fromstring(payload.decode("utf-8").strip("\x00"))
+                lead_params = {p.get("name"): int(p.text or 0) for p in lead.iter(f"{{{XML_NAMESPACE}}}Parameter")}
+                size, blocks = lead_params.get("MsgSize", 0), lead_params.get("MsgBlockCount", 0)
+                seen: set[int] = set()
+                data = b""
+                while len(seen) < blocks:
+                    block_id, block_type, _, block_payload = await protocol.queue.get()
+                    if block_type != _MSG_BLOCK or block_id in seen:
+                        continue
+                    seen.add(block_id)
+                    data += block_payload[_BLOCK_HEADER_OFFSET:]
+                payload = data[:size]
+        if compressed:
+            payload = zlib.decompress(payload)
+        return payload.decode("utf-8").strip("\x00")
+    finally:
+        transport.close()
+
+
 class ChlorinatorDiagnosticsCoordinator(DataUpdateCoordinator[dict[str, int] | None]):
     """Polls GetCHLORMeasurement for one chlorinator while its body of water has flow."""
 
@@ -154,7 +244,8 @@ class ChlorinatorDiagnosticsCoordinator(DataUpdateCoordinator[dict[str, int] | N
         if not self._has_flow():
             return None
         try:
-            resp = await self.main.omni._api.async_send_and_receive(REQUEST_MESSAGE_TYPE, build_request(self.bow_id, self.chlor_equip_id))
+            api = self.main.omni._api
+            resp = await _async_request(api.controller_ip, api.controller_port, build_request(self.bow_id, self.chlor_equip_id))
             return parse_response(resp)
         except Exception as err:
             raise UpdateFailed(f"Chlorinator diagnostics request failed: {err}") from err

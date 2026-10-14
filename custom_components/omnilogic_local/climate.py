@@ -191,7 +191,8 @@ class OmniLogicClimateEntity(OmniLogicEntity[Heater], ClimateEntity):
             "omni_solar_set_point": self.equipment.solar_set_point,
             "omni_why_on": self.equipment.why_on,
         }
-        for _, system_id, heater_equip in self.equipment.heater_equipment.items():
+        # EquipmentDict.items() yields (system_id, name, equipment)
+        for system_id, _, heater_equip in self.equipment.heater_equipment.items():
             name = heater_equip.name or "unknown"
             prefix = f"omni_heater_equip_{name}_"
             extra_state_attributes |= {
