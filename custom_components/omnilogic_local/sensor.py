@@ -9,6 +9,7 @@ from homeassistant.const import UnitOfPower, UnitOfRatio, UnitOfTemperature
 from pyomnilogic_local import CSAD, Backyard, Bow, Chlorinator, Filter, HeaterEquipment, Sensor
 from pyomnilogic_local.omnitypes import ChlorinatorDispenserType, CSADMode, FilterState, HeaterType, SensorType
 
+from .chlorinator_diagnostics import async_add_chlorinator_diagnostic_sensors
 from .const import BACKYARD_SYSTEM_ID, DOMAIN, KEY_COORDINATOR
 from .entity import OmniLogicEntity
 from .typing import OmniLogicEquipment
@@ -214,6 +215,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         )
 
     async_add_entities(entities)
+
+    # Local addition: chlorinator cell diagnostics (see chlorinator_diagnostics.py)
+    async_add_chlorinator_diagnostic_sensors(hass, coordinator, async_add_entities)
 
 
 type SensedEquipment = Backyard | Bow | HeaterEquipment
