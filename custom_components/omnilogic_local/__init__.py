@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
+    Platform.CLIMATE,  # Local addition: climate.py (heat/cool thermostat)
     Platform.LIGHT,
     Platform.NUMBER,
     Platform.SELECT,
