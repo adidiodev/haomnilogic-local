@@ -1,4 +1,4 @@
-"""Chlorinator cell diagnostics (cell temperature, voltage, current, board temperature).
+"""Chlorinator cell diagnostics (cell temperature, voltage, current, board temperature, polarity).
 
 Local addition to haomnilogic-local (adidiodev fork).
 
@@ -23,10 +23,17 @@ firmware R0502000, 2026-10-14):
   temperatures = thermistor lookup table below (tenths of degF, raw // 8 indexes the table,
   raw % 8 interpolates). The app does not display board temperature; it is decoded with the same
   table as the cell, which gives plausible values but is an assumption.
+* Relay polarity comes from a second request, ``GetCHLORRelayPolarity`` (native ID 174), sent under
+  the same header type with the same params. The response is a single message (op 1174) carrying
+  ``RelaySetting``; the app shows 0 as "Off" (cell not generating) and n as "K<n>" (K1/K2).
+  Confirmed against the app: K1 2026-10-18 19:27 and K2 2026-10-19 06:38 while generating,
+  Off between cycles.
 
 Changelog
     1.0.0 - 2026-10-14 - Initial version: cell temp, cell voltage, cell current, board temp.
     1.0.1 - 2026-10-14 - Own UDP transport: the library rejected the LeadMessage (SourceOpId 1163).
+    1.1.0 - 2026-10-19 - Relay polarity sensor (GetCHLORRelayPolarity). A polarity failure only
+                         makes that one sensor unavailable; the measurement sensors are unaffected.
 """
 
 from __future__ import annotations
@@ -77,6 +84,9 @@ _SEND_ATTEMPTS = 3
 _ACK_BODY = f'<Request xmlns="{XML_NAMESPACE}">\n<Name>Ack</Name>\n</Request>'
 REQUEST_NAME = "GetCHLORMeasurement"
 RESPONSE_NAME = "GetCHLORMeasurementRsp"
+POLARITY_REQUEST_NAME = "GetCHLORRelayPolarity"
+POLARITY_RESPONSE_NAME = "GetCHLORRelayPolarityRsp"
+POLARITY_OPTIONS = ["Off", "K1", "K2"]
 
 INVALID_RAW = 65535
 
@@ -120,22 +130,30 @@ def decode_current(raw: int | None) -> float | None:
     return round(raw * 5 / 255 / 0.489, 2)
 
 
-def build_request(pool_id: int, chlor_id: int) -> str:
+def decode_polarity(raw: int | None) -> str | None:
+    """Mirror the app: 0 -> "Off", n -> "K<n>"; anything outside K1/K2 is reported as unknown."""
+    if raw is None:
+        return None
+    value = "Off" if raw == 0 else f"K{raw}"
+    return value if value in POLARITY_OPTIONS else None
+
+
+def build_request(pool_id: int, chlor_id: int, name: str = REQUEST_NAME) -> str:
     body = ET.Element("Request", {"xmlns": XML_NAMESPACE})
-    ET.SubElement(body, "Name").text = REQUEST_NAME
+    ET.SubElement(body, "Name").text = name
     params = ET.SubElement(body, "Parameters")
     for name, value in (("PoolID", pool_id), ("ChlorID", chlor_id)):
         ET.SubElement(params, "Parameter", name=name, dataType="int").text = str(value)
     return ET.tostring(body, xml_declaration=True, encoding="unicode")
 
 
-def parse_response(xml: str) -> dict[str, int]:
-    """Parse a GetCHLORMeasurementRsp into {base_name: raw}, combining High/Low byte pairs."""
+def parse_response(xml: str, expected: str = RESPONSE_NAME) -> dict[str, int]:
+    """Parse a chlorinator response into {base_name: raw}, combining High/Low byte pairs."""
     root = ET.fromstring(xml)
     ns = {"h": XML_NAMESPACE}
     name = root.findtext("h:Name", namespaces=ns) or root.findtext("Name")
-    if name != RESPONSE_NAME:
-        msg = f"Unexpected response {name!r} to {REQUEST_NAME}"
+    if name != expected:
+        msg = f"Unexpected response {name!r}, expected {expected!r}"
         raise ValueError(msg)
     params: dict[str, int] = {}
     for param in root.iter(f"{{{XML_NAMESPACE}}}Parameter"):
@@ -243,17 +261,30 @@ class ChlorinatorDiagnosticsCoordinator(DataUpdateCoordinator[dict[str, int] | N
         # No flow means no meaningful cell readings (and the cell is off), so skip the request.
         if not self._has_flow():
             return None
+        api = self.main.omni._api
         try:
-            api = self.main.omni._api
             resp = await _async_request(api.controller_ip, api.controller_port, build_request(self.bow_id, self.chlor_equip_id))
-            return parse_response(resp)
+            values = parse_response(resp)
         except Exception as err:
             raise UpdateFailed(f"Chlorinator diagnostics request failed: {err}") from err
+        # Polarity is best effort: without it only the polarity sensor goes unavailable.
+        try:
+            resp = await _async_request(
+                api.controller_ip,
+                api.controller_port,
+                build_request(self.bow_id, self.chlor_equip_id, POLARITY_REQUEST_NAME),
+            )
+            polarity = parse_response(resp, POLARITY_RESPONSE_NAME)
+            if "RelaySetting" in polarity:
+                values["RelaySetting"] = polarity["RelaySetting"]
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Chlorinator relay polarity request failed: %s", err)
+        return values
 
 
 @dataclass(frozen=True, kw_only=True)
 class ChlorDiagSensorDescription(SensorEntityDescription):
-    value_fn: Callable[[dict[str, int]], float | None]
+    value_fn: Callable[[dict[str, int]], float | str | None]
     raw_key: str
 
 
@@ -301,6 +332,15 @@ DIAG_SENSORS: tuple[ChlorDiagSensorDescription, ...] = (
         raw_key="BoardTemp",
         value_fn=lambda d: decode_temp_f(d.get("BoardTemp")),
     ),
+    ChlorDiagSensorDescription(
+        key="chlorinator_relay_polarity",
+        name="Chlorinator Relay Polarity",
+        device_class=SensorDeviceClass.ENUM,
+        options=POLARITY_OPTIONS,
+        icon="mdi:swap-horizontal",
+        raw_key="RelaySetting",
+        value_fn=lambda d: decode_polarity(d.get("RelaySetting")),
+    ),
 )
 
 
@@ -316,10 +356,14 @@ class ChlorinatorDiagnosticSensor(CoordinatorEntity[ChlorinatorDiagnosticsCoordi
 
     @property
     def available(self) -> bool:
-        return super().available and self.coordinator.data is not None
+        return (
+            super().available
+            and self.coordinator.data is not None
+            and self.entity_description.raw_key in self.coordinator.data
+        )
 
     @property
-    def native_value(self) -> float | None:
+    def native_value(self) -> float | str | None:
         if self.coordinator.data is None:
             return None
         return self.entity_description.value_fn(self.coordinator.data)

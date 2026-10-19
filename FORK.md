@@ -7,7 +7,7 @@ This fork tracks [cryptk/haomnilogic-local](https://github.com/cryptk/haomnilogi
 | Change | Files | Status upstream |
 |---|---|---|
 | Climate entity for virtual heaters: Heat / Cool / Auto / Off for cooling-capable heat pumps, per-unit attributes | `climate.py`, one line in `__init__.py` `PLATFORMS` | Not proposed yet |
-| Chlorinator cell diagnostics: cell temp, cell voltage, cell current, board temp (`GetCHLORMeasurement`), polled every 60 s while the body of water has flow | `chlorinator_diagnostics.py`, hook at end of `sensor.async_setup_entry` | Library equivalent is open as python-omnilogic-local PR #154; switch to it once merged |
+| Chlorinator cell diagnostics: cell temp, cell voltage, cell current, board temp (`GetCHLORMeasurement`) and relay polarity Off/K1/K2 (`GetCHLORRelayPolarity`, 2.0.2.3), polled every 60 s while the body of water has flow | `chlorinator_diagnostics.py`, hook at end of `sensor.async_setup_entry` | Library equivalent is open as python-omnilogic-local PR #154; switch to it once merged |
 | Grace polls + stuck-entity fix (cherry-picked from kfriedenberger, PR #272) | `const.py`, `coordinator.py`, `entity.py` | Open as PR #272; drop the commit once merged |
 
 ## Releases
